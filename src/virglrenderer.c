@@ -1339,8 +1339,13 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
    if (!map)
       return -EOPNOTSUPP;
 
-   if (map == MAP_FAILED)
-      return -EINVAL;
+   if (map == MAP_FAILED) {
+      /* darwin/16K-host fixup: the caller-provided fixed address may not be
+       * aligned to the host page size (guest 4K offsets on 16K hosts).
+       * Report as unsupported so the caller falls back to a renderer-chosen
+       * mapping instead of failing the MAP_BLOB. */
+      return -EOPNOTSUPP;
+   }
 
    return 0;
 }
