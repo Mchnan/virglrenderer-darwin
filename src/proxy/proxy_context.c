@@ -166,22 +166,28 @@ static int
 proxy_context_sync_thread(void *arg)
 {
    struct proxy_context *ctx = arg;
+   const int fence_eventfd = ctx->sync_thread.fence_eventfd;
    struct pollfd poll_fds[2] = {
       [0] = {
-         .fd = ctx->sync_thread.fence_eventfd,
+         .fd = fence_eventfd,
          .events = POLLIN,
       },
       [1] = {
          .fd = ctx->socket.fd,
       },
    };
+   /* Without an eventfd (e.g., on hosts without eventfd support), poll the
+    * socket only and wake up periodically to check the fence shmem. */
+   struct pollfd *const poll_base = fence_eventfd >= 0 ? &poll_fds[0] : &poll_fds[1];
+   const nfds_t poll_nfds = fence_eventfd >= 0 ? 2 : 1;
+   const int poll_timeout = fence_eventfd >= 0 ? -1 : 2;
 
    assert(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB);
 
    while (!ctx->sync_thread.stop) {
-      const int ret = poll(poll_fds, ARRAY_SIZE(poll_fds), -1);
-      if (ret <= 0) {
-         if (ret < 0 && (errno == EINTR || errno == EAGAIN))
+      const int ret = poll(poll_base, poll_nfds, poll_timeout);
+      if (ret < 0) {
+         if (errno == EINTR || errno == EAGAIN)
             continue;
 
          proxy_log("failed to poll fence eventfd");
@@ -515,15 +521,15 @@ proxy_context_destroy(struct virgl_context *base)
    if (!proxy_client_destroy_context(ctx->client, ctx->base.ctx_id))
       proxy_log("failed to destroy ctx %d", ctx->base.ctx_id);
 
-   if (ctx->sync_thread.fence_eventfd >= 0) {
-      if (ctx->sync_thread.created) {
-         ctx->sync_thread.stop = true;
+   if (ctx->sync_thread.created) {
+      ctx->sync_thread.stop = true;
+      if (ctx->sync_thread.fence_eventfd >= 0)
          write_eventfd(ctx->sync_thread.fence_eventfd, 1);
-         thrd_join(ctx->sync_thread.thread, NULL);
-      }
-
-      close(ctx->sync_thread.fence_eventfd);
+      thrd_join(ctx->sync_thread.thread, NULL);
    }
+
+   if (ctx->sync_thread.fence_eventfd >= 0)
+      close(ctx->sync_thread.fence_eventfd);
 
    if (ctx->shmem.ptr)
       munmap(ctx->shmem.ptr, ctx->shmem.size);
@@ -569,20 +575,27 @@ static bool
 proxy_context_init_fencing(struct proxy_context *ctx)
 {
    /* The render server updates the shmem for the current seqnos and
-    * optionally notifies using the eventfd.  That means, when only
-    * VIRGL_RENDERER_THREAD_SYNC is set, we just need to set up the eventfd.
-    * When VIRGL_RENDERER_ASYNC_FENCE_CB is also set, we need to create a sync
-    * thread as well.
-    *
-    * Fence polling can always check the shmem directly.
+    * optionally notifies using the eventfd.  When only
+    * VIRGL_RENDERER_THREAD_SYNC is set, the host polls the eventfd via
+    * get_fencing_fd and calls retire_fences itself.  When
+    * VIRGL_RENDERER_ASYNC_FENCE_CB is set, a sync thread retires fences:
+    * it waits on the eventfd when one exists, or polls the fence shmem
+    * periodically otherwise (hosts without eventfd support, where
+    * virgl_renderer_init also strips VIRGL_RENDERER_THREAD_SYNC).
     */
-   if (!(proxy_renderer.flags & VIRGL_RENDERER_THREAD_SYNC))
+   if (!(proxy_renderer.flags & (VIRGL_RENDERER_THREAD_SYNC |
+                                 VIRGL_RENDERER_ASYNC_FENCE_CB)))
       return true;
 
    ctx->sync_thread.fence_eventfd = create_eventfd(0);
    if (ctx->sync_thread.fence_eventfd < 0) {
-      proxy_log("failed to create fence eventfd");
-      return false;
+      if (!(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB)) {
+         proxy_log("failed to create fence eventfd");
+         return false;
+      }
+      /* eventfd is Linux-only.  The sync thread polls the fence shmem
+       * periodically instead, so keep going without the eventfd. */
+      proxy_log("no eventfd support; sync thread polls fence shmem");
    }
 
    if (proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB) {
