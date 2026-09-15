@@ -199,9 +199,15 @@ vkr_dispatch_vkCreateRingMESA(struct vn_dispatch_context *dispatch,
 
    const struct vkr_resource *res = vkr_context_get_resource(ctx, info->resourceId);
    if (!res || res->fd_type != VIRGL_RESOURCE_FD_SHM) {
+      vkr_log("vkCreateRingMESA: resource %u not found or not SHM", info->resourceId);
       vkr_context_set_fatal(ctx);
       return;
    }
+
+   vkr_log("vkCreateRingMESA: res=%u off=%zu size=%zu head=%zu tail=%zu status=%zu buf=[%zu,+%zu) extra=[%zu,+%zu)",
+           info->resourceId, info->offset, info->size,
+           info->headOffset, info->tailOffset, info->statusOffset,
+           info->bufferOffset, info->bufferSize, info->extraOffset, info->extraSize);
 
    struct vkr_ring_layout layout;
    if (!vkr_ring_layout_init(&layout, res, info)) {
@@ -276,10 +282,13 @@ vkr_dispatch_vkDestroyRingMESA(struct vn_dispatch_context *dispatch,
    }
 
    struct vkr_ring *ring = lookup_ring(ctx, args->ring);
+   vkr_log("vkDestroyRingMESA: ring %llu found=%d", (unsigned long long)args->ring, !!ring);
    if (!ring || !vkr_ring_stop(ring)) {
+      vkr_log("vkDestroyRingMESA: stop failed, setting fatal");
       vkr_context_set_fatal(ctx);
       return;
    }
+   vkr_log("vkDestroyRingMESA: stopped, destroying");
 
    mtx_lock(&ctx->ring_mutex);
    vkr_ring_destroy(ring);
@@ -300,6 +309,7 @@ vkr_dispatch_vkNotifyRingMESA(struct vn_dispatch_context *dispatch,
 
    struct vkr_ring *ring = lookup_ring(ctx, args->ring);
    if (!ring) {
+      vkr_log("vkNotifyRingMESA: ring %llu not found", (unsigned long long)args->ring);
       vkr_context_set_fatal(ctx);
       return;
    }
@@ -343,10 +353,12 @@ vkr_dispatch_vkSubmitVirtqueueSeqnoMESA(struct vn_dispatch_context *dispatch,
 
    struct vkr_ring *ring = lookup_ring(ctx, args->ring);
    if (!ring) {
+      vkr_log("vkSubmitVirtqueueSeqnoMESA: ring not found");
       vkr_context_set_fatal(ctx);
       return;
    }
 
+   vkr_log("vkSubmitVirtqueueSeqnoMESA: seqno=%llu", (unsigned long long)args->seqno);
    vkr_ring_submit_virtqueue_seqno(ring, args->seqno);
 }
 
@@ -366,8 +378,10 @@ vkr_dispatch_vkWaitVirtqueueSeqnoMESA(struct vn_dispatch_context *dispatch,
 #pragma GCC diagnostic ignored "-Wpedantic"
    struct vkr_ring *ring = container_of(dispatch, struct vkr_ring, dispatch);
 #pragma GCC diagnostic pop
+   vkr_log("vkWaitVirtqueueSeqnoMESA: waiting seqno=%llu", (unsigned long long)args->seqno);
    if (!vkr_ring_wait_virtqueue_seqno(ring, args->seqno))
       vkr_context_set_fatal(ctx);
+   vkr_log("vkWaitVirtqueueSeqnoMESA: done seqno=%llu", (unsigned long long)args->seqno);
 }
 
 static void

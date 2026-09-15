@@ -254,6 +254,7 @@ vkr_ring_thread(void *arg)
 
    snprintf(thread_name, ARRAY_SIZE(thread_name), "vkr-ring-%d", ctx->ctx_id);
    u_thread_setname(thread_name);
+   vkr_log("vkr_ring_thread: ring %u entered", ring->id);
    if (ring->prio_valid && setpriority(PRIO_PROCESS, 0, ring->prio)) {
 #ifdef DEBUG
       /* Currently venus doesn't forward the CAP_SYS_NICE request upon forking, so
@@ -301,6 +302,8 @@ vkr_ring_thread(void *arg)
 
       const uint32_t cmd_size = vkr_ring_load_tail(ring) - ring->buffer.cur;
       if (cmd_size) {
+         vkr_log("vkr_ring_thread: ring %u processing cmd_size=%u cur=%u", ring->id,
+                 cmd_size, ring->buffer.cur);
          if (cmd_size > ring->buffer.size) {
             vkr_log("%s: cmd_size(%u) > ring->buffer.size(%u)", __func__, cmd_size,
                     ring->buffer.size);
@@ -340,6 +343,7 @@ vkr_ring_thread(void *arg)
    }
 
 out:
+   vkr_log("vkr_ring_thread: ring %u exiting ret=%d", ring->id, ret);
    if (ret < 0) {
       vkr_ring_set_status_bits(ring, VK_RING_STATUS_FATAL_BIT_MESA);
       vkr_context_on_ring_fatal(ctx);
@@ -356,8 +360,12 @@ vkr_ring_start(struct vkr_ring *ring)
    assert(!ring->started);
    ring->started = true;
    ret = thrd_create(&ring->thread, vkr_ring_thread, ring);
-   if (ret != thrd_success)
+   if (ret != thrd_success) {
+      vkr_log("vkr_ring_start: thrd_create failed ret=%d errno=%d", ret, errno);
       ring->started = false;
+   } else {
+      vkr_log("vkr_ring_start: ring %u thread created", ring->id);
+   }
 }
 
 bool
