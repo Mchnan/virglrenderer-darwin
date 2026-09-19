@@ -11,6 +11,30 @@
 #include "vkr_device.h"
 #include "vkr_instance.h"
 
+/* Layout-compatible stand-in for VkBaseInStructure/VkBaseOutStructure
+ * (both are {sType, pNext}); avoids const mismatches when walking the
+ * two chain flavors. */
+struct vkr_pnext_node {
+   VkStructureType sType;
+   struct vkr_pnext_node *pNext;
+};
+
+/* Return the link (pNext field of the preceding struct) that points at
+ * the first struct with |stype| in the chain starting after |head|, or
+ * NULL when absent.  Detach via *link = (*link)->pNext and relink via
+ * *link = node. */
+static inline struct vkr_pnext_node **
+vkr_pnext_find_link(void *head, VkStructureType stype)
+{
+   struct vkr_pnext_node *n = head;
+   while (n->pNext) {
+      if (n->pNext->sType == stype)
+         return &n->pNext;
+      n = n->pNext;
+   }
+   return NULL;
+}
+
 #ifdef HAVE_LINUX_UDMABUF_H
 #include <fcntl.h>
 
@@ -775,6 +799,65 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+
+   /* MoltenVK fails the whole query with FORMAT_NOT_SUPPORTED when the
+    * input chain carries VkImageFormatListCreateInfo or the output chain
+    * carries the ycbcr / host-image-copy property structs, although it
+    * advertises the corresponding extensions and accepts the same structs
+    * in vkCreateImage (zink's image-config negotiation always sends the
+    * format list for XRGB-style formats plus the ycbcr query struct, so
+    * every candidate would fail and gbm buffer allocation would die
+    * before reaching the device).  Retry with those structs detached;
+    * the detached output structs keep their zero-initialized values,
+    * which is the honest answer (MVK reports no hostImageCopy feature
+    * and the formats queried through this path are non-YCbCr). */
+   if (args->ret != VK_SUCCESS && args->pImageFormatInfo) {
+      struct vkr_pnext_node *detached_in = NULL;
+      struct vkr_pnext_node **in_link = vkr_pnext_find_link(
+         (void *)args->pImageFormatInfo,
+         VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO);
+      if (in_link) {
+         detached_in = *in_link;
+         *in_link = detached_in->pNext;
+      }
+
+      struct vkr_pnext_node *detached_ycbcr = NULL;
+      struct vkr_pnext_node *detached_hic = NULL;
+      struct vkr_pnext_node **ycbcr_link = NULL;
+      struct vkr_pnext_node **hic_link = NULL;
+      if (args->pImageFormatProperties) {
+         ycbcr_link = vkr_pnext_find_link(
+            args->pImageFormatProperties,
+            VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES);
+         if (ycbcr_link) {
+            detached_ycbcr = *ycbcr_link;
+            *ycbcr_link = detached_ycbcr->pNext;
+         }
+         hic_link = vkr_pnext_find_link(
+            args->pImageFormatProperties,
+            VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT);
+         if (hic_link) {
+            detached_hic = *hic_link;
+            *hic_link = detached_hic->pNext;
+         }
+      }
+
+      if (in_link || ycbcr_link || hic_link) {
+         args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
+            args->physicalDevice, args->pImageFormatInfo,
+            args->pImageFormatProperties);
+         /* restore the guest-visible chains; the detached output structs
+          * keep their zero-initialized values.  Restore in the reverse
+          * order of detachment: links captured later may alias links
+          * captured earlier once the earlier node is relinked. */
+         if (detached_hic)
+            *hic_link = detached_hic;
+         if (detached_ycbcr)
+            *ycbcr_link = detached_ycbcr;
+         if (detached_in)
+            *in_link = detached_in;
+      }
+   }
 
    /* MoltenVK fails the whole query when the pNext chain asks about
     * external memory it does not understand.  Retry without the external

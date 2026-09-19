@@ -350,6 +350,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
             }
          }
       } else if (physical_dev->EXT_external_memory_metal) {
+         /* MoltenVK rejects any allocation carrying VkExportMemoryAllocateInfo
+          * with handle types it does not implement, and the guest zink always
+          * requests dma-buf export for PIPE_BIND_SHARED buffers.  Unlink the
+          * export info before handing the chain to the host driver; the
+          * export is satisfied at the resource level via the shm blob. */
+         if (export_info && export_info != &local_export_info) {
+            void *prev_of_export_info = vkr_find_prev_struct(
+               alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+            vkr_pnext_set_next(prev_of_export_info, export_info->pNext);
+         }
+
          /* Allocate shm and wrap as a MTLBuffer for import. */
          mtl_shm = vkr_mtl_shm_alloc(dev->mtl_device, alloc_info->allocationSize);
          if (!mtl_shm) {
