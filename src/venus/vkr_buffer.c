@@ -37,6 +37,26 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
     * vkr_physical_device_init_memory_properties as well.
     */
 
+   /* darwin: MoltenVK rejects vkCreateBuffer with
+    * VK_ERROR_FEATURE_NOT_PRESENT when the chain carries
+    * VkExternalMemoryBufferCreateInfo for a handle type it does not
+    * implement (dma-buf).  The export is virtual on this stack, so
+    * detach the struct like vkr_dispatch_vkCreateImage does. */
+   {
+      struct vkr_device *dev = vkr_device_from_handle(args->device);
+      if (dev->physical_device->EXT_external_memory_metal) {
+         VkBaseOutStructure **link =
+            (VkBaseOutStructure **)&((VkBufferCreateInfo *)args->pCreateInfo)->pNext;
+         while (*link) {
+            if ((*link)->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO) {
+               *link = (*link)->pNext;
+               continue;
+            }
+            link = &(*link)->pNext;
+         }
+      }
+   }
+
    vkr_buffer_create_and_add(dispatch->data, args);
 }
 

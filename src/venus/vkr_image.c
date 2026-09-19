@@ -31,6 +31,28 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
+   /* darwin: MoltenVK rejects vkCreateImage outright with
+    * VK_ERROR_FEATURE_NOT_PRESENT when the chain carries
+    * VkExternalMemoryImageCreateInfo for a handle type it does not
+    * implement (dma-buf), and the guest zink always chains it for
+    * PIPE_BIND_SHARED buffers.  The export is virtual: guest-side
+    * export/import runs through the guest kernel's PRIME ioctls and the
+    * host side never sees a foreign-queue layout, so detach the struct. */
+   {
+      struct vkr_device *dev = vkr_device_from_handle(args->device);
+      if (dev->physical_device->EXT_external_memory_metal) {
+         VkBaseOutStructure **link =
+            (VkBaseOutStructure **)&((VkImageCreateInfo *)args->pCreateInfo)->pNext;
+         while (*link) {
+            if ((*link)->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+               *link = (*link)->pNext;
+               continue;
+            }
+            link = &(*link)->pNext;
+         }
+      }
+   }
+
    vkr_image_create_and_add(dispatch->data, args);
 }
 
