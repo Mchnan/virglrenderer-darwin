@@ -339,6 +339,19 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
     * MoltenVK doesn't natively support it, but virglrenderer implements
     * fd-based memory export using Metal buffers backed by POSIX SHM.
     *
+    * Snapshot the host-native list first so vkCreateDevice can filter the
+    * guest's enabled extensions against what the host driver really has.
+    */
+   physical_dev->host_extensions = malloc(sizeof(*exts) * advertised_count);
+   if (physical_dev->host_extensions) {
+      memcpy(physical_dev->host_extensions, exts, sizeof(*exts) * advertised_count);
+      physical_dev->host_extension_count = advertised_count;
+   }
+
+   /* On macOS, VK_KHR_external_memory_fd is emulated via Metal shared memory.
+    * MoltenVK doesn't natively support it, but virglrenderer implements
+    * fd-based memory export using Metal buffers backed by POSIX SHM.
+    *
     * Inject it into the advertised list so the guest Venus driver accepts
     * the physical device (it's a hard requirement in vn_physical_device.c).
     * The guest never enables it in vkCreateDevice — Mesa's Venus driver

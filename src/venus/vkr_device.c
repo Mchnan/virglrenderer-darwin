@@ -189,29 +189,27 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
       }
    }
 
-   /* The guest zink enables the darwin-injected memory extensions
-    * (EXT_external_memory_dma_buf, EXT_queue_family_foreign) in
-    * vkCreateDevice, but the venus driver forwards them to the host and
-    * MoltenVK rejects unknown extensions.  The data plane for these runs
-    * entirely through the guest kernel's PRIME ioctls, so strip them
-    * from the host-side device creation. */
-   if (physical_dev->EXT_external_memory_metal) {
-      static const char *darwin_stripped[] = {
-         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-         VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
-      };
+   /* The guest zink enables extensions that the guest-visible list
+    * advertises (darwin-injected memory extensions and whitelist entries
+    * MoltenVK lacks) and the venus driver forwards them to the host,
+    * where MoltenVK rejects unknown extensions with
+    * VK_ERROR_EXTENSION_NOT_PRESENT.  Their data plane runs through the
+    * guest kernel's PRIME ioctls or vkr dispatch shims and never needs
+    * the host driver, so intersect the guest's enabled list with the
+    * extensions the host driver actually reports. */
+   if (physical_dev->EXT_external_memory_metal && physical_dev->host_extensions) {
       const char **names =
          (const char **)((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames;
       uint32_t count = ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount;
       for (uint32_t i = 0; i < count; i++) {
-         bool drop = false;
-         for (unsigned s = 0; s < ARRAY_SIZE(darwin_stripped); s++) {
-            if (!strcmp(names[i], darwin_stripped[s])) {
-               drop = true;
+         bool host_has = false;
+         for (uint32_t e = 0; e < physical_dev->host_extension_count; e++) {
+            if (!strcmp(names[i], physical_dev->host_extensions[e].extensionName)) {
+               host_has = true;
                break;
             }
          }
-         if (drop) {
+         if (!host_has) {
             memmove(&names[i], &names[i + 1], (count - i - 1) * sizeof(*names));
             count--;
             i--;

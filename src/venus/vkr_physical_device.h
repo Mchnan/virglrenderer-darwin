@@ -21,6 +21,12 @@ struct vkr_physical_device {
    VkExtensionProperties *extensions;
    uint32_t extension_count;
 
+   /* extensions the host driver natively reports; equals |extensions|
+    * minus the darwin injections.  Used to filter the guest's enabled
+    * extension list at vkCreateDevice. */
+   VkExtensionProperties *host_extensions;
+   uint32_t host_extension_count;
+
    bool KHR_external_memory_fd;
    bool EXT_external_memory_dma_buf;
    bool KHR_portability_subset;
