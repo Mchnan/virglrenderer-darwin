@@ -364,6 +364,37 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
       }
    }
 
+   /* On macOS, also advertise the dma-buf / foreign-queue-family memory
+    * extensions that MoltenVK lacks.  Guest zink requires all three of
+    * KHR_external_memory_fd + EXT_external_memory_dma_buf +
+    * EXT_queue_family_foreign to set caps.dmabuf, which mesa's libgbm
+    * needs to pick the DRI image path over dumb buffers.  The data plane
+    * never touches host fd namespaces: guest-side export/import goes
+    * through the guest kernel's PRIME ioctls on blob GEM handles, and
+    * host allocations requesting dma-buf export are handled in the
+    * Metal shm path of vkAllocateMemory.  As above, the physical_dev
+    * flags stay untouched so the host-side vkCreateDevice list is not
+    * affected; the venus protocol keeps these extensions out of the
+    * host device creation. */
+   if (physical_dev->EXT_external_memory_metal) {
+      static const char *darwin_injected[] = {
+         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+         VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(darwin_injected); i++) {
+         VkExtensionProperties *new_exts =
+            realloc(exts, sizeof(*exts) * (advertised_count + 1));
+         if (!new_exts) {
+            vkr_log("failed to inject %s", darwin_injected[i]);
+            break;
+         }
+         exts = new_exts;
+         strcpy(exts[advertised_count].extensionName, darwin_injected[i]);
+         exts[advertised_count].specVersion = 0;
+         advertised_count++;
+      }
+   }
+
    physical_dev->extensions = realloc(exts, sizeof(*exts) * advertised_count);
    physical_dev->extension_count = advertised_count;
 }
