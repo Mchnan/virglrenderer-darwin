@@ -666,6 +666,26 @@ vkr_dispatch_vkGetPhysicalDeviceSparseImageFormatProperties(
       args->tiling, args->pPropertyCount, args->pProperties);
 }
 
+/* MoltenVK advertises VK_KHR/EXT_robustness2 but reports nullDescriptor=0,
+ * which hard-disables zink on the guest.  Metal's nil-bound descriptor
+ * behavior (reads return zero, writes are dropped) matches the nullDescriptor
+ * contract, so report it as supported and strip the feature struct from
+ * vkCreateDevice pNext chains before MoltenVK can reject it. */
+static void
+vkr_darwin_force_null_descriptor(void *pNext)
+{
+   while (pNext) {
+      struct VkBaseOutStructure *s = (struct VkBaseOutStructure *)pNext;
+      if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
+         VkPhysicalDeviceRobustness2FeaturesEXT *r2 =
+            (VkPhysicalDeviceRobustness2FeaturesEXT *)pNext;
+         r2->nullDescriptor = VK_TRUE;
+         return;
+      }
+      pNext = s->pNext;
+   }
+}
+
 static void
 vkr_dispatch_vkGetPhysicalDeviceFeatures2(
    UNUSED struct vn_dispatch_context *dispatch,
@@ -677,6 +697,7 @@ vkr_dispatch_vkGetPhysicalDeviceFeatures2(
 
    vn_replace_vkGetPhysicalDeviceFeatures2_args_handle(args);
    vk->GetPhysicalDeviceFeatures2(args->physicalDevice, args->pFeatures);
+   vkr_darwin_force_null_descriptor(args->pFeatures);
 }
 
 static void
@@ -754,6 +775,58 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+
+   /* MoltenVK fails the whole query when the pNext chain asks about
+    * external memory it does not understand.  Retry without the external
+    * info and synthesize the dma-buf answer (see
+    * vkr_darwin_force_dma_buf_exportable for why this is sound). */
+   if (args->ret != VK_SUCCESS && args->pImageFormatInfo) {
+      const VkBaseInStructure *info_link =
+         (const VkBaseInStructure *)args->pImageFormatInfo->pNext;
+      bool wants_dma_buf = false;
+      while (info_link) {
+         if (info_link->sType ==
+             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO) {
+            const VkPhysicalDeviceExternalImageFormatInfo *ext =
+               (const VkPhysicalDeviceExternalImageFormatInfo *)info_link;
+            wants_dma_buf =
+               ext->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            break;
+         }
+         info_link = info_link->pNext;
+      }
+      if (wants_dma_buf) {
+         ((VkPhysicalDeviceImageFormatInfo2 *)args->pImageFormatInfo)->pNext = NULL;
+         args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
+            args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+         if (args->ret == VK_SUCCESS) {
+            ((VkPhysicalDeviceImageFormatInfo2 *)args->pImageFormatInfo)->pNext =
+               (void *)(uintptr_t)info_link;
+         }
+      }
+   }
+
+   if (args->ret == VK_SUCCESS && args->pImageFormatProperties) {
+      VkBaseOutStructure *props_link =
+         (VkBaseOutStructure *)args->pImageFormatProperties->pNext;
+      while (props_link) {
+         if (props_link->sType == VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES) {
+            VkExternalImageFormatProperties *ext =
+               (VkExternalImageFormatProperties *)props_link;
+            if (ext->externalMemoryProperties.externalMemoryFeatures == 0) {
+               ext->externalMemoryProperties.externalMemoryFeatures =
+                  VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                  VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+               ext->externalMemoryProperties.exportFromImportedHandleTypes =
+                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+               ext->externalMemoryProperties.compatibleHandleTypes =
+                  VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            }
+            break;
+         }
+         props_link = props_link->pNext;
+      }
+   }
 }
 
 static void
@@ -770,6 +843,26 @@ vkr_dispatch_vkGetPhysicalDeviceSparseImageFormatProperties2(
       args->physicalDevice, args->pFormatInfo, args->pPropertyCount, args->pProperties);
 }
 
+/* darwin shim: MoltenVK has no dma-buf export, so the host driver reports
+ * VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT as unsupported and zink
+ * refuses to create gbm render buffers.  On venus the data plane never
+ * touches the host fd namespace anyway: buffers become HOST3D blobs whose
+ * guest-side export/import goes through the guest kernel's PRIME ioctls.
+ * Force-report dma-buf as exportable+importable so zink proceeds. */
+static void
+vkr_darwin_force_dma_buf_exportable(
+   const VkPhysicalDeviceExternalBufferInfo *info,
+   VkExternalMemoryProperties *props)
+{
+   if (info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+      return;
+   props->externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                                   VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+   props->exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   props->compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+}
+
 static void
 vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
    UNUSED struct vn_dispatch_context *dispatch,
@@ -782,6 +875,8 @@ vkr_dispatch_vkGetPhysicalDeviceExternalBufferProperties(
    vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
    vk->GetPhysicalDeviceExternalBufferProperties(
       args->physicalDevice, args->pExternalBufferInfo, args->pExternalBufferProperties);
+   vkr_darwin_force_dma_buf_exportable(args->pExternalBufferInfo,
+                                       &args->pExternalBufferProperties->externalMemoryProperties);
 }
 
 static void

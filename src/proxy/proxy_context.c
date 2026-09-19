@@ -280,6 +280,7 @@ proxy_context_submit_cmd(struct virgl_context *base, const void *buffer, size_t 
    if (!size)
       return 0;
 
+
    struct render_context_op_submit_cmd_request req = {
       .header.op = RENDER_CONTEXT_OP_SUBMIT_CMD,
       .size = size,

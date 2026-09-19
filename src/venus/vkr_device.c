@@ -173,6 +173,22 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
       return;
    }
 
+   /* MoltenVK reports nullDescriptor=0 and would reject (or mis-execute)
+    * a Robustness2Features struct requesting it; the vkr physical device
+    * already force-reports nullDescriptor to the guest (Metal's nil
+    * descriptor behavior matches the contract).  Strip the struct from
+    * the guest's pNext chain so the host driver never sees the request. */
+   {
+      VkBaseOutStructure **link = (VkBaseOutStructure **)&((VkDeviceCreateInfo *)args->pCreateInfo)->pNext;
+      while (*link) {
+         if ((*link)->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
+            *link = (*link)->pNext;
+            continue;
+         }
+         link = &(*link)->pNext;
+      }
+   }
+
    vn_replace_vkCreateDevice_args_handle(args);
    args->ret = vk->CreateDevice(args->physicalDevice, args->pCreateInfo, NULL,
                                 &dev->base.handle.device);
