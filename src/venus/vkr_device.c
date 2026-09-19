@@ -176,7 +176,7 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    /* MoltenVK reports nullDescriptor=0 and would reject (or mis-execute)
     * a Robustness2Features struct requesting it; the vkr physical device
     * already force-reports nullDescriptor to the guest (Metal's nil
-    * descriptor behavior matches the contract).  Strip the struct from
+     * descriptor behavior matches the contract).  Strip the struct from
     * the guest's pNext chain so the host driver never sees the request. */
    {
       VkBaseOutStructure **link = (VkBaseOutStructure **)&((VkDeviceCreateInfo *)args->pCreateInfo)->pNext;
@@ -187,6 +187,38 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
          }
          link = &(*link)->pNext;
       }
+   }
+
+   /* The guest zink enables the darwin-injected memory extensions
+    * (EXT_external_memory_dma_buf, EXT_queue_family_foreign) in
+    * vkCreateDevice, but the venus driver forwards them to the host and
+    * MoltenVK rejects unknown extensions.  The data plane for these runs
+    * entirely through the guest kernel's PRIME ioctls, so strip them
+    * from the host-side device creation. */
+   if (physical_dev->EXT_external_memory_metal) {
+      static const char *darwin_stripped[] = {
+         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+         VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+      };
+      const char **names =
+         (const char **)((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames;
+      uint32_t count = ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount;
+      for (uint32_t i = 0; i < count; i++) {
+         bool drop = false;
+         for (unsigned s = 0; s < ARRAY_SIZE(darwin_stripped); s++) {
+            if (!strcmp(names[i], darwin_stripped[s])) {
+               drop = true;
+               break;
+            }
+         }
+         if (drop) {
+            memmove(&names[i], &names[i + 1], (count - i - 1) * sizeof(*names));
+            count--;
+            i--;
+         }
+      }
+      ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = names;
+      ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = count;
    }
 
    vn_replace_vkCreateDevice_args_handle(args);
