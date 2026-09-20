@@ -15,8 +15,10 @@
 
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
+                                   void *mtl_device,
                                    const VkImportMemoryResourceInfoMESA *res_info,
-                                   VkImportMemoryFdInfoKHR *out)
+                                   VkImportMemoryFdInfoKHR *out,
+                                   struct vkr_mtl_shm **out_mtl_shm)
 {
    struct vkr_resource *res = vkr_context_get_resource(ctx, res_info->resourceId);
    if (!res) {
@@ -24,6 +26,29 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
       vkr_context_set_fatal(ctx);
       return false;
    }
+
+#ifdef __APPLE__
+   /* darwin: HOST3D blob resources are backed by shm fds, which no Vulkan
+    * driver here can import as fd handle types.  Wrap the backing as an
+    * MTLBuffer and import via VK_EXT_external_memory_metal instead; the
+    * exported memory then aliases the same pages the guest reaches through
+    * the blob's hostmem BAR mapping. */
+   if (res->fd_type == VIRGL_RESOURCE_FD_SHM && out_mtl_shm) {
+      int fd = os_dupfd_cloexec(res->u.fd);
+      if (fd < 0)
+         return false;
+
+      struct vkr_mtl_shm *shm = vkr_mtl_shm_import(mtl_device, fd, 0);
+      if (!shm) {
+         close(fd);
+         return false;
+      }
+      *out_mtl_shm = shm;
+      memset(out, 0, sizeof(*out));
+      out->fd = -1; /* ownership moved into shm */
+      return true;
+   }
+#endif
 
    VkExternalMemoryHandleTypeFlagBits handle_type;
    switch (res->fd_type) {
@@ -34,6 +59,8 @@ vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
       break;
    default:
+      vkr_log("failed to import resource %u: unsupported fd_type %d",
+              res_info->resourceId, res->fd_type);
       return false;
    }
 
@@ -260,19 +287,47 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       return;
    }
 
-   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
+   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR
+    * in place; on darwin a shm-backed resource becomes an MTLBuffer import
+    * instead, and the returned vkr_mtl_shm is attached to the memory. */
    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
+   VkImportMemoryMetalHandleInfoEXT local_import_metal = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLBUFFER_BIT_EXT,
+   };
+   struct vkr_mtl_shm *import_shm = NULL;
    VkImportMemoryResourceInfoMESA *res_info = NULL;
    void *prev_of_res_info = vkr_find_prev_struct(
       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
    if (prev_of_res_info) {
       res_info = (VkImportMemoryResourceInfoMESA *)vkr_pnext_get_next(prev_of_res_info);
-      if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+      if (!vkr_get_fd_info_from_resource_info(ctx, dev->mtl_device, res_info,
+                                              &local_import_info, &import_shm)) {
          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
          return;
       }
 
-      vkr_pnext_set_next(prev_of_res_info, &local_import_info);
+      if (import_shm) {
+         local_import_metal.pNext = res_info->pNext;
+         local_import_metal.handle = import_shm->mtl_buffer;
+         vkr_pnext_set_next(prev_of_res_info, &local_import_metal);
+         alloc_info->allocationSize = import_shm->shm_size;
+
+         /* MoltenVK only accepts MTL* handle types in external-memory
+          * chains.  The guest always asks for dma-buf export on shared
+          * buffers; that export is virtual (it lands on the guest kernel's
+          * PRIME path), so drop the request before the chain reaches the
+          * host driver. */
+         void *prev_of_export = vkr_find_prev_struct(
+            alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
+         if (prev_of_export) {
+            VkExportMemoryAllocateInfo *exp =
+               (VkExportMemoryAllocateInfo *)vkr_pnext_get_next(prev_of_export);
+            vkr_pnext_set_next(prev_of_export, exp->pNext);
+         }
+      } else {
+         vkr_pnext_set_next(prev_of_res_info, &local_import_info);
+      }
    }
 
    VkExportMemoryAllocateInfo *export_info =
@@ -421,6 +476,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
       if (gbm_bo)
          vkr_gbm_bo_destroy(gbm_bo);
       vkr_mtl_shm_free(mtl_shm);
+      vkr_mtl_shm_free(import_shm);
       return;
    }
 
@@ -430,7 +486,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->valid_fd_types = valid_fd_types;
    mem->udmabuf_fd = udmabuf_fd;
    mem->gbm_bo = gbm_bo;
-   mem->mtl_shm = mtl_shm;
+   mem->mtl_shm = import_shm ? import_shm : mtl_shm;
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = mem_type_index;
 }

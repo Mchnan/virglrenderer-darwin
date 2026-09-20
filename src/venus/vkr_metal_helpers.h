@@ -39,6 +39,12 @@ vkr_metal_get_device(VkDevice vk_device, PFN_vkGetDeviceProcAddr GetDeviceProcAd
 struct vkr_mtl_shm *
 vkr_mtl_shm_alloc(void *mtl_device, uint64_t size);
 
+/* Wrap an existing SHM fd (a virgl shm resource backing) as an
+ * MTLBuffer-backed vkr_mtl_shm for VkImportMemoryMetalHandleInfoEXT
+ * import.  The struct takes ownership of fd.  Returns NULL on failure. */
+struct vkr_mtl_shm *
+vkr_mtl_shm_import(void *mtl_device, int fd, uint64_t size);
+
 /* Release all resources held by a vkr_mtl_shm and free the struct. */
 void
 vkr_mtl_shm_free(struct vkr_mtl_shm *shm);
@@ -57,6 +63,15 @@ static inline struct vkr_mtl_shm *
 vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
 {
    (void)mtl_device;
+   (void)size;
+   return NULL;
+}
+
+static inline struct vkr_mtl_shm *
+vkr_mtl_shm_import(void *mtl_device, int fd, uint64_t size)
+{
+   (void)mtl_device;
+   (void)fd;
    (void)size;
    return NULL;
 }

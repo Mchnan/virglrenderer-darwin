@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "util/anon_file.h"
@@ -39,19 +40,25 @@ vkr_metal_get_device(VkDevice vk_device, PFN_vkGetDeviceProcAddr GetDeviceProcAd
 struct vkr_mtl_shm *
 vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
 {
-   if (!mtl_device)
+   if (!mtl_device) {
+      vkr_log("vkr_mtl_shm_alloc: no mtl_device");
       return NULL;
+   }
 
    const size_t page_size = getpagesize();
    const size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
 
    int shm_fd = os_create_anonymous_file(aligned_size, "vkr-metal-mem");
-   if (shm_fd < 0)
+   if (shm_fd < 0) {
+      vkr_log("vkr_mtl_shm_alloc: anonymous_file failed size=%llu errno=%d",
+              (unsigned long long)aligned_size, errno);
       return NULL;
+   }
 
    void *shm_ptr =
       mmap(NULL, aligned_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
    if (shm_ptr == MAP_FAILED) {
+      vkr_log("vkr_mtl_shm_alloc: mmap failed errno=%d", errno);
       close(shm_fd);
       return NULL;
    }
@@ -62,6 +69,8 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
                                                    options:MTLResourceStorageModeShared
                                                deallocator:nil];
    if (!buffer) {
+      vkr_log("vkr_mtl_shm_alloc: newBufferWithBytesNoCopy failed size=%llu",
+              (unsigned long long)aligned_size);
       munmap(shm_ptr, aligned_size);
       close(shm_fd);
       return NULL;
@@ -69,6 +78,7 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
 
    struct vkr_mtl_shm *shm = calloc(1, sizeof(*shm));
    if (!shm) {
+      vkr_log("vkr_mtl_shm_alloc: calloc failed");
       CFRelease(buffer);
       munmap(shm_ptr, aligned_size);
       close(shm_fd);
@@ -79,6 +89,66 @@ vkr_mtl_shm_alloc(void *mtl_device, uint64_t size)
    shm->shm_ptr = shm_ptr;
    shm->shm_size = aligned_size;
    shm->mtl_buffer = (void *)buffer;
+   return shm;
+}
+
+struct vkr_mtl_shm *
+vkr_mtl_shm_import(void *mtl_device, int fd, uint64_t size)
+{
+   if (!mtl_device || fd < 0) {
+      vkr_log("vkr_mtl_shm_import: bad args dev=%p fd=%d", mtl_device, fd);
+      return NULL;
+   }
+
+   struct stat st;
+   if (fstat(fd, &st) < 0 || st.st_size <= 0) {
+      vkr_log("vkr_mtl_shm_import: fstat failed errno=%d size=%lld", errno,
+              (long long)(st.st_size));
+      return NULL;
+   }
+   const size_t shm_size = (size_t)st.st_size;
+   /* size == 0 means "use the whole fd", which is what the virgl resource
+    * import path passes (a zero-length MTLBuffer wrap fails otherwise). */
+   const uint64_t want = (size != 0 && size < shm_size) ? size : shm_size;
+
+   void *shm_ptr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+   if (shm_ptr == MAP_FAILED) {
+      vkr_log("vkr_mtl_shm_import: mmap failed errno=%d", errno);
+      return NULL;
+   }
+
+   id<MTLDevice> device = (id<MTLDevice>)mtl_device;
+   /* MTLBuffer wrap requires page alignment of both pointer and length. */
+   const size_t page_size = getpagesize();
+   const uint64_t buf_len = (want + page_size - 1) & ~((uint64_t)page_size - 1);
+   if (buf_len > shm_size) {
+      vkr_log("vkr_mtl_shm_import: shm smaller than requested (%zu < %llu)",
+              shm_size, (unsigned long long)buf_len);
+      munmap(shm_ptr, shm_size);
+      return NULL;
+   }
+   id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:shm_ptr
+                                                    length:buf_len
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+   if (!buffer) {
+      vkr_log("vkr_mtl_shm_import: newBufferWithBytesNoCopy failed len=%llu",
+              (unsigned long long)buf_len);
+      munmap(shm_ptr, shm_size);
+      return NULL;
+   }
+
+   struct vkr_mtl_shm *shm = calloc(1, sizeof(*shm));
+   if (!shm) {
+      CFRelease(buffer);
+      munmap(shm_ptr, shm_size);
+      return NULL;
+   }
+   shm->shm_fd = fd; /* ownership taken */
+   shm->shm_ptr = shm_ptr;
+   shm->shm_size = shm_size;
+   shm->mtl_buffer = (void *)buffer;
+   (void)want;
    return shm;
 }
 

@@ -198,6 +198,18 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
     * the host driver, so intersect the guest's enabled list with the
     * extensions the host driver actually reports. */
    if (physical_dev->EXT_external_memory_metal && physical_dev->host_extensions) {
+      /* Extensions appended above for vkr's own use must survive the
+       * intersection even when the venus-protocol table does not know
+       * them (e.g. the Metal extensions on darwin).  Stripping them
+       * breaks vkExportMetalObjectsEXT and the whole shm import path.
+       * Only the extensions the host driver natively implements belong
+       * here; the fd/dma-buf/fence trio stays filterable so the guest
+       * never enables what the host driver lacks. */
+      static const char *const own_use_exts[] = {
+         "VK_EXT_external_memory_metal",
+         "VK_EXT_metal_objects",
+         "VK_KHR_portability_subset",
+      };
       const char **names =
          (const char **)((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames;
       uint32_t count = ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount;
@@ -210,6 +222,15 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
             }
          }
          if (!host_has) {
+            bool own_use = false;
+            for (size_t o = 0; o < sizeof(own_use_exts) / sizeof(own_use_exts[0]); o++) {
+               if (!strcmp(names[i], own_use_exts[o])) {
+                  own_use = true;
+                  break;
+               }
+            }
+            if (own_use)
+               continue;
             memmove(&names[i], &names[i + 1], (count - i - 1) * sizeof(*names));
             count--;
             i--;

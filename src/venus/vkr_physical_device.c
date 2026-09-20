@@ -393,6 +393,13 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
       static const char *darwin_injected[] = {
          VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
          VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+         /* MoltenVK lacks the modifier extension; guest zink requires it to
+          * reallocate non-exportable gbm images into exportable backings
+          * (zink_resource_get_handle rebind path) and refuses the export
+          * with EINVAL otherwise.  The host side rewrites modifier-tiled
+          * images to OPTIMAL in vkCreateImage (see vkr_image.c), so the
+          * extension is capability-only for the guest. */
+         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
       };
       for (unsigned i = 0; i < ARRAY_SIZE(darwin_injected); i++) {
          VkExtensionProperties *new_exts =
@@ -403,7 +410,13 @@ vkr_physical_device_init_extensions(struct vkr_physical_device *physical_dev)
          }
          exts = new_exts;
          strcpy(exts[advertised_count].extensionName, darwin_injected[i]);
-         exts[advertised_count].specVersion = 0;
+         /* Advertise the real spec version: guest drivers gate extension
+          * support on the advertised version (a 0 here reads as
+          * "unsupported" and silently disables the feature). */
+         exts[advertised_count].specVersion =
+            vkr_extension_get_spec_version(darwin_injected[i]);
+         vkr_log("inject %s sv=%u", darwin_injected[i],
+                 exts[advertised_count].specVersion);
          advertised_count++;
       }
    }
@@ -625,6 +638,14 @@ vkr_dispatch_vkEnumerateDeviceExtensionProperties(
    if (!args->pProperties) {
       *args->pPropertyCount = physical_dev->extension_count;
       args->ret = VK_SUCCESS;
+      if (true) {
+         for (uint32_t i = 0; i < physical_dev->extension_count; i++) {
+            const char *n = physical_dev->extensions[i].extensionName;
+            if (strstr(n, "dma_buf") || strstr(n, "modifier") ||
+                strstr(n, "foreign") || strstr(n, "external_memory"))
+               vkr_log("guest sees ext: %s", n);
+         }
+      }
       return;
    }
 
@@ -829,6 +850,7 @@ vkr_dispatch_vkGetPhysicalDeviceFormatProperties2(
    vn_replace_vkGetPhysicalDeviceFormatProperties2_args_handle(args);
    vk->GetPhysicalDeviceFormatProperties2(args->physicalDevice, args->format,
                                           args->pFormatProperties);
+
 }
 
 static void
@@ -952,6 +974,38 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
             break;
          }
          props_link = props_link->pNext;
+      }
+   }
+
+   /* darwin: MoltenVK implements neither LINEAR nor DRM_FORMAT_MODIFIER
+    * tiling, so a query for either fails even though the guest zink needs
+    * a positive answer to allocate gbm's RENDERING|LINEAR buffers.  The
+    * tiling is rewritten to OPTIMAL on vkCreateImage and the linear pitch
+    * is synthesized by vkGetImageSubresourceLayout (vkr_image.c), so
+    * answer the query from the OPTIMAL configuration with the modifier
+    * info detached. */
+   if (args->ret != VK_SUCCESS && args->pImageFormatInfo) {
+      VkPhysicalDeviceImageFormatInfo2 *info =
+         (VkPhysicalDeviceImageFormatInfo2 *)args->pImageFormatInfo;
+      if (info->tiling == VK_IMAGE_TILING_LINEAR ||
+          info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+         const VkImageTiling saved_tiling = info->tiling;
+         struct vkr_pnext_node *detached_mod = NULL;
+         struct vkr_pnext_node **mod_link = vkr_pnext_find_link(
+            (void *)info,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+         if (mod_link) {
+            detached_mod = *mod_link;
+            *mod_link = detached_mod->pNext;
+         }
+
+         info->tiling = VK_IMAGE_TILING_OPTIMAL;
+         args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
+            args->physicalDevice, args->pImageFormatInfo,
+            args->pImageFormatProperties);
+         info->tiling = saved_tiling;
+         if (detached_mod)
+            *mod_link = detached_mod;
       }
    }
 }

@@ -10,6 +10,13 @@
 
 struct vkr_image {
    struct vkr_object base;
+   /* Geometry recorded at vkCreateImage (darwin only) so
+    * vkGetImageSubresourceLayout can report honest linear pitches:
+    * MoltenVK answers the query for OPTIMAL-tiled images with garbage
+    * (e.g. rowPitch=258 for a 64-wide image). */
+   uint32_t width;
+   uint32_t height;
+   VkFormat format;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 
